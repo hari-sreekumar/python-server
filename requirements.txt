@@ -10,3 +10,6 @@ langchain-text-splitters
 langchain-groq
 python-dotenv
 groq
+fastapi
+uvicorn[standard]
+pydantic
