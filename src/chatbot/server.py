@@ -8,7 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 from pydantic import BaseModel
 
-from rag_pipeline import RAGPipeline, build_context
+try:  # run as a package (e.g. `uvicorn src.chatbot.server:app`)
+    from .rag_pipeline import RAGPipeline, build_context
+except ImportError:  # run as a script (`python src/chatbot/server.py`)
+    from rag_pipeline import RAGPipeline, build_context
 
 load_dotenv()
 
