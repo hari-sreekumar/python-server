@@ -67,9 +67,12 @@ def new_history() -> list[dict]:
 
 
 RAG_PROMPT = (
-    "Answer the question using the document excerpts below. Base facts on them "
-    "and mention the source file/page. If they don't contain the answer, say so "
-    "briefly instead of guessing.\n\n"
+    "Below are excerpts from the user's documents. Use them only if they actually "
+    "help answer the question. Only when you rely on them, mention the source "
+    "file/page; otherwise answer normally and do NOT cite or mention the excerpts "
+    "(greetings, thanks and small talk never need citations). If the question is "
+    "about the documents but they don't contain the answer, say so briefly "
+    "instead of guessing.\n\n"
     "Excerpts:\n{context}\n\nQuestion: {question}"
 )
 

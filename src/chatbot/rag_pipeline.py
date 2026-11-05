@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import chromadb
+import numpy as np
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -62,6 +63,7 @@ class RAGPipeline:
         self.client = chromadb.PersistentClient(path=str(persist_dir))
         self.collection = self._get_collection()
         self._bm25: BM25Okapi | None = None
+        self._embeddings = np.empty((0, 0))
         self._bm25_corpus: tuple[list[str], list[str], list[dict]] = ([], [], [])
 
     def _get_collection(self):
@@ -106,10 +108,15 @@ class RAGPipeline:
         if self.collection.count() == 0:
             self.ingest()
 
+    @staticmethod
+    def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+        return float(a @ b / ((np.linalg.norm(a) * np.linalg.norm(b)) or 1.0))
+
     def _get_bm25(self) -> BM25Okapi:
         if self._bm25 is None:
-            data = self.collection.get(include=["documents", "metadatas"])
+            data = self.collection.get(include=["documents", "metadatas", "embeddings"])
             self._bm25_corpus = (data["ids"], data["documents"], data["metadatas"])
+            self._embeddings = np.asarray(data["embeddings"], dtype=float)
             self._bm25 = BM25Okapi([_tokenize(d) for d in data["documents"]])
         return self._bm25
 
@@ -124,8 +131,8 @@ class RAGPipeline:
     ) -> list[dict[str, Any]]:
         """mode: 'dense' (vector only) or 'hybrid' (vector + BM25 fused with RRF).
 
-        min_score is a cosine-similarity floor. In hybrid mode a chunk is kept if it
-        clears the floor OR has a keyword (BM25) match, so exact-term hits survive.
+        min_score is a cosine-similarity floor applied in both modes, so a keyword-only
+        match (e.g. "Hi" matching a greeting in a PDF) can't pull in irrelevant context.
         """
         hits = self._retrieve(query, top_k, min_score, mode, candidates)
         get_client().update_current_span(
@@ -141,8 +148,9 @@ class RAGPipeline:
         if self.collection.count() == 0:
             return []
         n = top_k if mode == "dense" else max(candidates, top_k)
+        query_vec = np.asarray(self._embed([query])[0], dtype=float)
         res = self.collection.query(
-            query_embeddings=self._embed([query]),
+            query_embeddings=[query_vec.tolist()],
             n_results=n,
             include=["documents", "metadatas", "distances"],
         )
@@ -169,7 +177,8 @@ class RAGPipeline:
         for idx, bscore in sparse:
             h = by_id.setdefault(
                 ids[idx],
-                {"id": ids[idx], "content": texts[idx], "metadata": metas[idx], "score": None},
+                {"id": ids[idx], "content": texts[idx], "metadata": metas[idx],
+                 "score": self._cosine(query_vec, self._embeddings[idx])},
             )
             h["bm25"] = bscore
         fused = reciprocal_rank_fusion(
@@ -179,7 +188,7 @@ class RAGPipeline:
         hits = []
         for doc_id, rrf in sorted(fused.items(), key=lambda x: x[1], reverse=True):
             h = by_id[doc_id]
-            if (h["score"] is not None and h["score"] >= min_score) or "bm25" in h:
+            if h["score"] >= min_score:
                 hits.append(
                     {
                         "content": h["content"],
