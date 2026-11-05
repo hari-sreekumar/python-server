@@ -8,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 from pydantic import BaseModel
 
+from rag_pipeline import RAGPipeline, build_context
+
 load_dotenv()
 
 api_key = os.getenv("GROQ_API_KEY")
@@ -55,6 +57,16 @@ def new_history() -> list[dict]:
     ]
 
 
+RAG_PROMPT = (
+    "Answer the question using the document excerpts below. Base facts on them "
+    "and mention the source file/page. If they don't contain the answer, say so "
+    "briefly instead of guessing.\n\n"
+    "Excerpts:\n{context}\n\nQuestion: {question}"
+)
+
+rag = RAGPipeline()
+rag.ensure_ingested()
+
 app = FastAPI(title="Hsk Chatbot")
 
 app.add_middleware(
@@ -96,9 +108,20 @@ def chat(req: ChatRequest) -> ChatResponse:
 
     messages.append({"role": "user", "content": req.message})
 
+    # RAG: fetch relevant PDF chunks and inject them for this turn only
+    hits = rag.retrieve(req.message)
+    llm_messages = list(messages)
+    if hits:
+        llm_messages[-1] = {
+            "role": "user",
+            "content": RAG_PROMPT.format(
+                context=build_context(hits), question=req.message
+            ),
+        }
+
     completion = client.chat.completions.create(
         model="openai/gpt-oss-20b",
-        messages=messages,
+        messages=llm_messages,
         temperature=1.1,
         top_p=0.9,
         presence_penalty=0.6,
@@ -108,6 +131,12 @@ def chat(req: ChatRequest) -> ChatResponse:
     messages.append({"role": "assistant", "content": reply})
 
     return ChatResponse(session_id=session_id, reply=reaction + reply)
+
+
+@app.post("/ingest")
+def ingest(reset: bool = True) -> dict:
+    """Re-read data/pdf and rebuild the Chroma index."""
+    return {"chunks": rag.ingest(reset=reset)}
 
 
 @app.delete("/session/{session_id}")
