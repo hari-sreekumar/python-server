@@ -3,20 +3,26 @@ import random
 import uuid
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from groq import Groq
-from pydantic import BaseModel
+
+load_dotenv()  # must run before Langfuse is imported/initialised
+os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "development")  # keep test traces out of prod
+
+from fastapi import FastAPI  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from langfuse import get_client, observe, propagate_attributes  # noqa: E402
+from langfuse.openai import OpenAI  # noqa: E402  (drop-in: traces model, tokens, cost)
+from pydantic import BaseModel  # noqa: E402
 
 try:  # run as a package (e.g. `uvicorn src.chatbot.server:app`)
     from .rag_pipeline import RAGPipeline, build_context
 except ImportError:  # run as a script (`python src/chatbot/server.py`)
     from rag_pipeline import RAGPipeline, build_context
 
-load_dotenv()
-
-api_key = os.getenv("GROQ_API_KEY")
-client = Groq(api_key=api_key)
+# Groq is OpenAI-compatible; the Langfuse-wrapped client traces every call as a generation.
+client = OpenAI(
+    base_url="https://api.groq.com/openai/v1", api_key=os.getenv("GROQ_API_KEY")
+)
+MODEL = "openai/gpt-oss-20b"
 
 GREETINGS = [
     "🤖 Hsk live!! Type 'quit' or 'stop' to exit \n",
@@ -100,40 +106,58 @@ def create_session() -> dict:
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
     session_id = req.session_id or str(uuid.uuid4())
+    # one trace per turn; session_id groups a conversation in Langfuse's Sessions view
+    with propagate_attributes(session_id=session_id, tags=["chatbot", "rag"]):
+        return _chat_response(req.message, session_id)
+
+
+@observe(name="chat-response", capture_input=False, capture_output=False)
+def _chat_response(message: str, session_id: str) -> ChatResponse:
+    lf = get_client()
+    # trace input/output = what a reviewer cares about, not raw function args
+    lf.update_current_span(input=message, metadata={"session_id": session_id})
+
     messages = sessions.setdefault(session_id, new_history())
 
-    lowered = req.message.lower()
+    lowered = message.lower()
     reaction = ""
     for keyword, emoji in REACTIONS.items():
         if keyword in lowered:
             reaction = emoji + " "
             break
 
-    messages.append({"role": "user", "content": req.message})
+    messages.append({"role": "user", "content": message})
 
     # RAG: fetch relevant PDF chunks and inject them for this turn only
-    hits = rag.retrieve(req.message)
+    hits = rag.retrieve(message)
     llm_messages = list(messages)
     if hits:
         llm_messages[-1] = {
             "role": "user",
-            "content": RAG_PROMPT.format(
-                context=build_context(hits), question=req.message
-            ),
+            "content": RAG_PROMPT.format(context=build_context(hits), question=message),
         }
 
     completion = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
+        name="generate-response",
+        metadata={"retrieved_chunks": len(hits)},
+        model=MODEL,
         messages=llm_messages,
         temperature=1.1,
         top_p=0.9,
         presence_penalty=0.6,
     )
 
-    reply = completion.choices[0].message.content or ""
+    msg = completion.choices[0].message
+    reply = msg.content or ""
+    # Reasoning models emit "thinking"; keep it in the trace for debugging decisions.
+    reasoning = getattr(msg, "reasoning", None)
+    if reasoning:
+        lf.update_current_span(metadata={"reasoning": reasoning})
     messages.append({"role": "assistant", "content": reply})
 
-    return ChatResponse(session_id=session_id, reply=reaction + reply)
+    final = reaction + reply
+    lf.update_current_span(output=final)
+    return ChatResponse(session_id=session_id, reply=final)
 
 
 @app.post("/ingest")
@@ -146,6 +170,11 @@ def ingest(reset: bool = True) -> dict:
 def delete_session(session_id: str) -> dict:
     sessions.pop(session_id, None)
     return {"ok": True}
+
+
+@app.on_event("shutdown")
+def flush_traces() -> None:
+    get_client().flush()
 
 
 @app.get("/health")

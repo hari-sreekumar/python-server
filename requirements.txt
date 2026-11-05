@@ -12,4 +12,9 @@ python-dotenv
 groq
 fastapi
 uvicorn[standard]
-pydantic
+pydanticlangfuse
+ragas
+langchain-huggingface
+datasets
+openai
+rank-bm25

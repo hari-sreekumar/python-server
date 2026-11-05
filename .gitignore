@@ -11,3 +11,4 @@ wheels/
 
 # Environment variables / secrets
 .env
+data/eval/results_*.csv

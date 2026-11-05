@@ -1,19 +1,44 @@
 """RAG pipeline: PDFs in data/pdf -> chunks -> embeddings -> ChromaDB -> retrieval."""
 
 import hashlib
+import re
 from pathlib import Path
 from typing import Any
 
 import chromadb
+from dotenv import load_dotenv
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
+
+load_dotenv()  # before Langfuse import so it sees credentials
+from langfuse import get_client, observe  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 PDF_DIR = ROOT / "data" / "pdf"
 VECTOR_DIR = ROOT / "data" / "vector_store"
 COLLECTION_NAME = "pdf_docs_rag"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+
+
+_TOKEN_RE = re.compile(r"\w+")
+RRF_K = 60  # standard RRF damping constant
+
+
+def _tokenize(text: str) -> list[str]:
+    return _TOKEN_RE.findall(text.lower())
+
+
+def reciprocal_rank_fusion(
+    rankings: list[list[str]], k: int = RRF_K
+) -> dict[str, float]:
+    """Fuse ranked id lists: score(id) = sum over lists of 1 / (k + rank), rank from 1."""
+    scores: dict[str, float] = {}
+    for ranking in rankings:
+        for rank, doc_id in enumerate(ranking, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+    return scores
 
 
 class RAGPipeline:
@@ -36,6 +61,8 @@ class RAGPipeline:
         persist_dir.mkdir(parents=True, exist_ok=True)
         self.client = chromadb.PersistentClient(path=str(persist_dir))
         self.collection = self._get_collection()
+        self._bm25: BM25Okapi | None = None
+        self._bm25_corpus: tuple[list[str], list[str], list[dict]] = ([], [], [])
 
     def _get_collection(self):
         return self.client.get_or_create_collection(
@@ -50,6 +77,7 @@ class RAGPipeline:
         if reset:
             self.client.delete_collection(self.collection_name)
             self.collection = self._get_collection()
+        self._bm25 = None
 
         docs = []
         for pdf in sorted(self.pdf_dir.glob("*.pdf")):
@@ -71,29 +99,98 @@ class RAGPipeline:
         self.collection.upsert(
             ids=ids, documents=texts, metadatas=metas, embeddings=self._embed(texts)
         )
+        self._bm25 = None  # corpus changed -> rebuild lazily
         return len(chunks)
 
     def ensure_ingested(self) -> None:
         if self.collection.count() == 0:
             self.ingest()
 
+    def _get_bm25(self) -> BM25Okapi:
+        if self._bm25 is None:
+            data = self.collection.get(include=["documents", "metadatas"])
+            self._bm25_corpus = (data["ids"], data["documents"], data["metadatas"])
+            self._bm25 = BM25Okapi([_tokenize(d) for d in data["documents"]])
+        return self._bm25
+
+    @observe(name="retrieve-context", as_type="retriever", capture_input=False, capture_output=False)
     def retrieve(
-        self, query: str, top_k: int = 4, min_score: float = 0.3
+        self,
+        query: str,
+        top_k: int = 4,
+        min_score: float = 0.3,
+        mode: str = "hybrid",
+        candidates: int = 20,
+    ) -> list[dict[str, Any]]:
+        """mode: 'dense' (vector only) or 'hybrid' (vector + BM25 fused with RRF).
+
+        min_score is a cosine-similarity floor. In hybrid mode a chunk is kept if it
+        clears the floor OR has a keyword (BM25) match, so exact-term hits survive.
+        """
+        hits = self._retrieve(query, top_k, min_score, mode, candidates)
+        get_client().update_current_span(
+            input=query,
+            output=[{"content": h["content"], "metadata": h["metadata"], "score": h["score"]} for h in hits],
+            metadata={"mode": mode, "top_k": top_k, "min_score": min_score, "num_hits": len(hits)},
+        )
+        return hits
+
+    def _retrieve(
+        self, query: str, top_k: int, min_score: float, mode: str, candidates: int
     ) -> list[dict[str, Any]]:
         if self.collection.count() == 0:
             return []
+        n = top_k if mode == "dense" else max(candidates, top_k)
         res = self.collection.query(
             query_embeddings=self._embed([query]),
-            n_results=top_k,
+            n_results=n,
             include=["documents", "metadatas", "distances"],
         )
+        dense = [
+            {"id": i, "content": t, "metadata": m, "score": 1 - d}
+            for i, t, m, d in zip(
+                res["ids"][0], res["documents"][0], res["metadatas"][0], res["distances"][0]
+            )
+        ]
+        if mode == "dense":
+            return [
+                {k: h[k] for k in ("content", "metadata", "score")}
+                for h in dense
+                if h["score"] >= min_score
+            ]
+
+        bm25 = self._get_bm25()
+        ids, texts, metas = self._bm25_corpus
+        scores = bm25.get_scores(_tokenize(query))
+        order = sorted(range(len(scores)), key=scores.__getitem__, reverse=True)
+        sparse = [(i, float(scores[i])) for i in order[:candidates] if scores[i] > 0]
+
+        by_id = {h["id"]: h for h in dense}
+        for idx, bscore in sparse:
+            h = by_id.setdefault(
+                ids[idx],
+                {"id": ids[idx], "content": texts[idx], "metadata": metas[idx], "score": None},
+            )
+            h["bm25"] = bscore
+        fused = reciprocal_rank_fusion(
+            [[h["id"] for h in dense], [ids[idx] for idx, _ in sparse]]
+        )
+
         hits = []
-        for text, meta, dist in zip(
-            res["documents"][0], res["metadatas"][0], res["distances"][0]
-        ):
-            score = 1 - dist  # cosine distance -> similarity
-            if score >= min_score:
-                hits.append({"content": text, "metadata": meta, "score": score})
+        for doc_id, rrf in sorted(fused.items(), key=lambda x: x[1], reverse=True):
+            h = by_id[doc_id]
+            if (h["score"] is not None and h["score"] >= min_score) or "bm25" in h:
+                hits.append(
+                    {
+                        "content": h["content"],
+                        "metadata": h["metadata"],
+                        "score": rrf,
+                        "dense_score": h["score"],
+                        "bm25_score": h.get("bm25"),
+                    }
+                )
+            if len(hits) == top_k:
+                break
         return hits
 
 
