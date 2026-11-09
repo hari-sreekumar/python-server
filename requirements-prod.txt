@@ -1,0 +1,15 @@
+# Runtime-only dependencies for the deployed API (no eval/dev tooling).
+# torch is installed separately in the Dockerfile as the CPU-only build.
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+openai
+langfuse
+chromadb
+sentence-transformers
+rank-bm25
+numpy
+pymupdf
+langchain-community
+langchain-text-splitters

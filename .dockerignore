@@ -1,0 +1,10 @@
+.git
+.venv
+.claude
+.vscode
+notebook
+data/vector_store
+data/eval
+data/text_files
+**/__pycache__
+.env

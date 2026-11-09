@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file: .env          # secrets live only on the server, never in the image
+    environment:
+      LANGFUSE_TRACING_ENVIRONMENT: production
+    volumes:
+      - vector_store:/app/data/vector_store   # keep the Chroma index across restarts
+
+volumes:
+  vector_store:
