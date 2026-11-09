@@ -19,4 +19,11 @@ curl -SL "https://github.com/docker/compose/releases/latest/download/docker-comp
   -o /usr/local/lib/docker/cli-plugins/docker-compose
 chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
+
+# buildx plugin (required by `docker compose build`; not shipped with Amazon Linux's docker)
+V=$(curl -fsSLI -o /dev/null -w "%{url_effective}" https://github.com/docker/buildx/releases/latest | sed "s#.*/##")
+curl -fsSL "https://github.com/docker/buildx/releases/download/$V/buildx-$V.linux-amd64" \
+  -o /usr/local/lib/docker/cli-plugins/docker-buildx
+chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
+
 touch /home/ec2-user/bootstrap-done
