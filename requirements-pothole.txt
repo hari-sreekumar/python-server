@@ -1,0 +1,15 @@
+# Pothole stack - install into its own env (see src/pothole/README.md), NOT the RAG env.
+# torch must be the CUDA 12.8 build for RTX 50-series; install it first:
+#   uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+ultralytics
+opencv-python-headless
+numpy
+scipy
+pandas
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+openai
+pytest
+lap

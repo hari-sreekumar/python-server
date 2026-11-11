@@ -12,3 +12,15 @@ wheels/
 # Environment variables / secrets
 .env
 data/eval/results_*.csv
+
+# --- pothole project: keep personal data, datasets, weights out of git ---
+data/video/
+data/pothole/
+models/
+runs/
+RDD2022/
+*.pt
+*.onnx
+.venv-pothole/
+data/vector_store/
+*.log
