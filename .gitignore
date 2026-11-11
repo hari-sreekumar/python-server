@@ -12,3 +12,11 @@ wheels/
 # Environment variables / secrets
 .env
 data/eval/results_*.csv
+
+# ML datasets, weights, training artifacts
+RDD2022/
+RDD2022/Czech
+data/pothole/
+models/
+train.log
+*.pt
